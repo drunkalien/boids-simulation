@@ -8,13 +8,13 @@ const TURNFACTOR: f32 = 0.2;
 const VISUAL_RANGE: f32 = 40.0;
 
 // PROTECTED_RANGE: Specifies the minimum distance to maintain from other boids to avoid collisions.
-const PROTECTED_RANGE: f32 = 15.0;
+const PROTECTED_RANGE: f32 = 8.0;
 
 // CENTERING_FACTOR: Determines how strongly boids are attracted to the center of the flock.
 const CENTERING_FACTOR: f32 = 0.0005;
 
 // AVOID_FACTOR: Controls how much boids avoid collisions with each other.
-const AVOID_FACTOR: f32 = 0.005;
+const AVOID_FACTOR: f32 = 0.05;
 
 // MATCHING_FACTOR: Controls how much boids attempt to match the velocity of their neighbors.
 const MATCHING_FACTOR: f32 = 0.05;
@@ -34,6 +34,9 @@ const BIAS_INCREMENT: f32 = 0.00004;
 // DEFAULT_BIAS_VAL: Sets the initial bias value for boids.
 const DEFAULT_BIAS_VAL: f32 = 0.001;
 
+const NUM_BOIDS: usize = 150;
+const BOUNDARY_MARGIN: f32 = 80.0;
+
 struct Params {
     turnfactor: f32,
     visual_range: f32,
@@ -48,61 +51,28 @@ struct Params {
     default_bias_val: f32,
 }
 
-struct Boid {
-    position: Vec2,
-    velocity: Vec2,
-    direction_x: DirectionX,
-    direction_y: DirectionY,
-}
-
-impl Boid {
-    fn separate(
-        &mut self,
-        boid_positions: &Vec<Vec2>,
-        current_boid_index: usize,
-        avoid_factor: f32,
-        protected_range: f32,
-        max_speed: f32,
-    ) {
-        let mut close_dx = 0.0f32;
-        let mut close_dy = 0.0f32;
-        for i in 0..boid_positions.len() {
-            if i == current_boid_index {
-                continue;
-            }
-            let other_boid_position = boid_positions[i];
-            let distance = self.position - other_boid_position;
-            if distance[0].abs() < protected_range || distance[1].abs() < protected_range {
-                close_dx += self.position[0] - other_boid_position[0];
-                close_dy += self.position[1] - other_boid_position[1];
-            }
-        }
-
-        self.position[0] += close_dx * avoid_factor;
-        self.position[1] += close_dy * avoid_factor;
-    }
-}
-
-enum DirectionX {
+#[derive(Clone, Copy, PartialEq)]
+enum ScoutGroup {
+    None,
     Right,
     Left,
 }
 
-enum DirectionY {
-    Top,
-    Bottom,
+#[derive(Clone, Copy)]
+struct Boid {
+    position: Vec2,
+    velocity: Vec2,
+    scout_group: ScoutGroup,
+    bias_val: f32,
 }
 
 struct Model {
-    _boids: Vec<Boid>,
-    _window: WindowId,
-    _params: Params,
+    boids: Vec<Boid>,
+    params: Params,
 }
 
-fn model(_app: &App) -> Model {
-    let window = _app.new_window().view(view).build().unwrap();
-    let position = pt2(-100.0, 100.0);
-    let velocity = pt2(4.0, 3.0);
+fn model(app: &App) -> Model {
+    app.new_window().size(1000, 700).view(view).build().unwrap();
 
     let params = Params {
         turnfactor: TURNFACTOR,
@@ -118,89 +88,172 @@ fn model(_app: &App) -> Model {
         max_bias: MAX_BIAS,
     };
 
-    let mut boids = Vec::new();
+    let mut boids = Vec::with_capacity(NUM_BOIDS);
 
-    for i in 0..10 {
-        let boid = Boid {
-            position: pt2(position[0] + i as f32 * 10.0, position[1] + i as f32 * 30.0),
-            velocity,
-            direction_x: DirectionX::Right,
-            direction_y: DirectionY::Top,
+    for i in 0..NUM_BOIDS {
+        let position = pt2(
+            random_range(-400.0, 400.0),
+            random_range(-250.0, 250.0),
+        );
+        let angle = random_range(0.0, PI * 2.0);
+        let speed = random_range(params.min_speed, params.max_speed);
+        let velocity = vec2(angle.cos() * speed, angle.sin() * speed);
+
+        let scout_group = if i < NUM_BOIDS / 10 {
+            ScoutGroup::Right
+        } else if i < (NUM_BOIDS * 2) / 10 {
+            ScoutGroup::Left
+        } else {
+            ScoutGroup::None
         };
 
-        boids.push(boid);
+        boids.push(Boid {
+            position,
+            velocity,
+            scout_group,
+            bias_val: params.default_bias_val,
+        });
     }
 
     Model {
-        _boids: boids,
-        _window: window,
-        _params: params,
+        boids,
+        params,
     }
 }
 
-fn update(_app: &App, _model: &mut Model, _update: Update) {
-    let boundary = _app.window_rect();
-    let boids = &mut _model._boids;
+fn update(app: &App, model: &mut Model, _update: Update) {
+    let boundary = app.window_rect();
+    let params = &model.params;
 
-    let mut boid_positions_snapshot: Vec<Vec2> = Vec::new();
+    let visual_range_sq = params.visual_range * params.visual_range;
+    let protected_range_sq = params.protected_range * params.protected_range;
 
-    for boid in boids {
-        boid_positions_snapshot.push(boid.position);
-    }
+    // Snapshot of previous frame state so all boid interactions are evaluated concurrently
+    let boid_snapshots = model.boids.clone();
 
-    let boids = &mut _model._boids;
+    for (i, boid) in model.boids.iter_mut().enumerate() {
+        let mut xpos_avg = 0.0;
+        let mut ypos_avg = 0.0;
+        let mut xvel_avg = 0.0;
+        let mut yvel_avg = 0.0;
+        let mut neighboring_boids = 0.0;
+        let mut close_dx = 0.0;
+        let mut close_dy = 0.0;
 
-    for i in 0..boids.len() {
-        let boid = &mut boids[i];
-        boid.separate(
-            &boid_positions_snapshot,
-            i,
-            _model._params.avoid_factor,
-            _model._params.protected_range,
-            _model._params.max_speed,
-        );
+        for (j, other) in boid_snapshots.iter().enumerate() {
+            if i == j {
+                continue;
+            }
 
-        if boid.velocity[0] > _model._params.max_speed {
-            boid.velocity[0] = _model._params.max_speed;
+            let diff = boid.position - other.position;
+            if diff.x.abs() < params.visual_range && diff.y.abs() < params.visual_range {
+                let squared_dist = diff.length_squared();
+
+                if squared_dist < protected_range_sq {
+                    // Separation: accumulate difference from nearby boids
+                    close_dx += diff.x;
+                    close_dy += diff.y;
+                } else if squared_dist < visual_range_sq {
+                    // Cohesion and Alignment: accumulate neighbors' position and velocity
+                    xpos_avg += other.position.x;
+                    ypos_avg += other.position.y;
+                    xvel_avg += other.velocity.x;
+                    yvel_avg += other.velocity.y;
+                    neighboring_boids += 1.0;
+                }
+            }
         }
 
-        if boid.velocity[1] > _model._params.max_speed {
-            boid.velocity[1] = _model._params.max_speed;
-        }
-        if boid.position[0] >= boundary.right() - 10.0 {
-            boid.direction_x = DirectionX::Left;
-        } else if boid.position[0] <= boundary.left() + 10.0 {
-            boid.direction_x = DirectionX::Right;
+        // Apply Cohesion and Alignment
+        if neighboring_boids > 0.0 {
+            xpos_avg /= neighboring_boids;
+            ypos_avg /= neighboring_boids;
+            xvel_avg /= neighboring_boids;
+            yvel_avg /= neighboring_boids;
+
+            boid.velocity.x += (xpos_avg - boid.position.x) * params.centering_factor
+                + (xvel_avg - boid.velocity.x) * params.matching_factor;
+            boid.velocity.y += (ypos_avg - boid.position.y) * params.centering_factor
+                + (yvel_avg - boid.velocity.y) * params.matching_factor;
         }
 
-        if boid.position[1] >= boundary.top() - 10.0 {
-            boid.direction_y = DirectionY::Bottom;
-        } else if boid.position[1] <= boundary.bottom() + 10.0 {
-            boid.direction_y = DirectionY::Top;
+        // Apply Separation
+        boid.velocity.x += close_dx * params.avoid_factor;
+        boid.velocity.y += close_dy * params.avoid_factor;
+
+        // Apply soft boundary steering
+        if boid.position.x < boundary.left() + BOUNDARY_MARGIN {
+            boid.velocity.x += params.turnfactor;
+        }
+        if boid.position.x > boundary.right() - BOUNDARY_MARGIN {
+            boid.velocity.x -= params.turnfactor;
+        }
+        if boid.position.y < boundary.bottom() + BOUNDARY_MARGIN {
+            boid.velocity.y += params.turnfactor;
+        }
+        if boid.position.y > boundary.top() - BOUNDARY_MARGIN {
+            boid.velocity.y -= params.turnfactor;
         }
 
-        match boid.direction_x {
-            DirectionX::Left => boid.position[0] -= boid.velocity[0],
-            DirectionX::Right => boid.position[0] += boid.velocity[0],
+        // Apply Scout bias
+        match boid.scout_group {
+            ScoutGroup::Right => {
+                if boid.velocity.x > 0.0 {
+                    boid.bias_val = (boid.bias_val + params.bias_increment).min(params.max_bias);
+                } else {
+                    boid.bias_val = (boid.bias_val - params.bias_increment).max(params.bias_increment);
+                }
+                boid.velocity.x = (1.0 - boid.bias_val) * boid.velocity.x + boid.bias_val * 1.0;
+            }
+            ScoutGroup::Left => {
+                if boid.velocity.x < 0.0 {
+                    boid.bias_val = (boid.bias_val + params.bias_increment).min(params.max_bias);
+                } else {
+                    boid.bias_val = (boid.bias_val - params.bias_increment).max(params.bias_increment);
+                }
+                boid.velocity.x = (1.0 - boid.bias_val) * boid.velocity.x + boid.bias_val * (-1.0);
+            }
+            ScoutGroup::None => {}
         }
 
-        match boid.direction_y {
-            DirectionY::Top => boid.position[1] += boid.velocity[1],
-            DirectionY::Bottom => boid.position[1] -= boid.velocity[1],
+        // Clamp speed between min_speed and max_speed
+        let speed = boid.velocity.length();
+        if speed > params.max_speed {
+            boid.velocity = (boid.velocity / speed) * params.max_speed;
+        } else if speed < params.min_speed {
+            if speed > 0.0001 {
+                boid.velocity = (boid.velocity / speed) * params.min_speed;
+            } else {
+                boid.velocity = vec2(params.min_speed, 0.0);
+            }
         }
+
+        // Update position
+        boid.position += boid.velocity;
     }
 }
 
-fn view(_app: &App, _model: &Model, frame: Frame) {
-    let draw = _app.draw();
+fn view(app: &App, model: &Model, frame: Frame) {
+    let draw = app.draw();
     draw.background().color(WHITE);
 
-    for boid in &_model._boids {
-        let position = boid.position;
-        draw.ellipse().xy(position).w_h(20.0, 20.0).color(BLACK);
+    for boid in &model.boids {
+        let angle = boid.velocity.y.atan2(boid.velocity.x);
+        let color = match boid.scout_group {
+            ScoutGroup::Right => rgb(0.2, 0.4, 0.8),
+            ScoutGroup::Left => rgb(0.8, 0.3, 0.3),
+            ScoutGroup::None => rgb(0.1, 0.1, 0.1),
+        };
+
+        // Draw streamlined boid pointing along its velocity vector
+        draw.ellipse()
+            .xy(boid.position)
+            .w_h(12.0, 6.0)
+            .rotate(angle)
+            .color(color);
     }
 
-    draw.to_frame(_app, &frame).unwrap();
+    draw.to_frame(app, &frame).unwrap();
 }
 
 fn main() {
